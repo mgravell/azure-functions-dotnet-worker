@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Globalization;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -27,15 +28,16 @@ namespace Microsoft.Azure.Functions.Worker
         private readonly ChannelWriter<StreamingMessage> _outputWriter;
 
         private readonly IFunctionsApplication _application;
-        private readonly FunctionRpcClient _rpcClient;
+        private readonly Func<FunctionRpcClient> _rpcClientFactory;
         private readonly IInvocationFeaturesFactory _invocationFeaturesFactory;
         private readonly IOutputBindingsInfoProvider _outputBindingsInfoProvider;
         private readonly IInputConversionFeatureProvider _inputConversionFeatureProvider;
         private readonly IMethodInfoLocator _methodInfoLocator;
         private readonly IOptions<GrpcWorkerStartupOptions> _startupOptions;
         private readonly ObjectSerializer _serializer;
+        private CancellationToken _startCancel;
 
-        public GrpcWorker(IFunctionsApplication application, FunctionRpcClient rpcClient, GrpcHostChannel outputChannel, IInvocationFeaturesFactory invocationFeaturesFactory,
+        public GrpcWorker(IFunctionsApplication application, Func<FunctionRpcClient> rpcClientFactory, GrpcHostChannel outputChannel, IInvocationFeaturesFactory invocationFeaturesFactory,
             IOutputBindingsInfoProvider outputBindingsInfoProvider, IMethodInfoLocator methodInfoLocator, 
             IOptions<GrpcWorkerStartupOptions> startupOptions, IOptions<WorkerOptions> workerOptions,
             IInputConversionFeatureProvider inputConversionFeatureProvider)
@@ -49,7 +51,7 @@ namespace Microsoft.Azure.Functions.Worker
             _outputWriter = outputChannel.Channel.Writer;
 
             _application = application ?? throw new ArgumentNullException(nameof(application));
-            _rpcClient = rpcClient ?? throw new ArgumentNullException(nameof(rpcClient));
+            _rpcClientFactory = rpcClientFactory ?? throw new ArgumentNullException(nameof(rpcClientFactory));
             _invocationFeaturesFactory = invocationFeaturesFactory ?? throw new ArgumentNullException(nameof(invocationFeaturesFactory));
             _outputBindingsInfoProvider = outputBindingsInfoProvider ?? throw new ArgumentNullException(nameof(outputBindingsInfoProvider));
             _methodInfoLocator = methodInfoLocator ?? throw new ArgumentNullException(nameof(methodInfoLocator));
@@ -58,9 +60,18 @@ namespace Microsoft.Azure.Functions.Worker
             _inputConversionFeatureProvider = inputConversionFeatureProvider ?? throw new ArgumentNullException(nameof(inputConversionFeatureProvider));
         }
 
-        public async Task StartAsync(CancellationToken token)
+        // this starts the *worker itself*, and starts a single gRPC back-haul
+        public Task StartAsync(CancellationToken token)
         {
-            var eventStream = _rpcClient.EventStream(cancellationToken: token);
+            _startCancel = token;
+            return StartGrpcClient();
+        }
+
+        // note that if the host supports multi-stream gRPC, we may end up creating multiple
+        // gRPC clients inside the same worker (advertising the same worker-id)
+        private async Task StartGrpcClient()
+        {
+            var eventStream = _rpcClientFactory().EventStream(cancellationToken: _startCancel);
 
             await SendStartStreamMessageAsync(eventStream.RequestStream);
 
@@ -125,7 +136,7 @@ namespace Microsoft.Azure.Functions.Worker
             }
             else if (request.ContentCase == MsgType.WorkerInitRequest)
             {
-                responseMessage.WorkerInitResponse = WorkerInitRequestHandler(request.WorkerInitRequest);
+                responseMessage.WorkerInitResponse = await WorkerInitRequestHandlerAsync(request.WorkerInitRequest);
             }
             else if (request.ContentCase == MsgType.FunctionLoadRequest)
             {
@@ -222,14 +233,33 @@ namespace Microsoft.Azure.Functions.Worker
             return response;
         }
 
-        internal static WorkerInitResponse WorkerInitRequestHandler(WorkerInitRequest request)
+        bool checkedMultiStream;
+        internal async Task<WorkerInitResponse> WorkerInitRequestHandlerAsync(WorkerInitRequest request)
         {
+            if (!checkedMultiStream) // only do this on the initial request - we don't want a fork-bomb
+            {
+                checkedMultiStream = true;
+                var caps = request.Capabilities;
+                if (caps is not null && caps.TryGetValue("MultiStream", out var val) && int.TryParse(val, NumberStyles.Integer, CultureInfo.InvariantCulture, out var count) && count > 1)
+                {
+                    if (count > 20) count = 20; // don't go too high
+                    try
+                    {
+                        for (int i = 1; i < count; i++)
+                        {
+                            await StartGrpcClient();
+                        }
+                    }
+                    catch { } // best effort only
+                }
+            }
+
             var response = new WorkerInitResponse
             {
                 Result = new StatusResult { Status = StatusResult.Types.Status.Success },
                 WorkerVersion = WorkerInformation.Instance.WorkerVersion
             };
-
+            
             response.Capabilities.Add("RpcHttpBodyOnly", bool.TrueString);
             response.Capabilities.Add("RawHttpBodyBytes", bool.TrueString);
             response.Capabilities.Add("RpcHttpTriggerMetadataRemoved", bool.TrueString);

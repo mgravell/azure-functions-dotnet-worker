@@ -26,7 +26,7 @@ namespace Microsoft.Extensions.DependencyInjection
                 UnboundedChannelOptions outputOptions = new UnboundedChannelOptions
                 {
                     SingleWriter = false,
-                    SingleReader = true,
+                    SingleReader = false,
                     AllowSynchronousContinuations = true
                 };
 
@@ -47,8 +47,7 @@ namespace Microsoft.Extensions.DependencyInjection
             });
 
             // gRPC Core services
-            services.AddSingleton<IWorker, GrpcWorker>();
-            services.AddSingleton<FunctionRpcClient>(p =>
+            services.AddSingleton<Func<FunctionRpcClient>>(p =>
             {
                 IOptions<GrpcWorkerStartupOptions> argumentsOptions = p.GetService<IOptions<GrpcWorkerStartupOptions>>()
                     ?? throw new InvalidOperationException("gRPC Services are not correctly registered.");
@@ -61,15 +60,18 @@ namespace Microsoft.Extensions.DependencyInjection
                     throw new InvalidOperationException($"The gRPC channel URI '{uriString}' could not be parsed.");
                 }
 
-                GrpcChannel grpcChannel = GrpcChannel.ForAddress(grpcUri, new GrpcChannelOptions()
+                return () =>
                 {
-                    MaxReceiveMessageSize = arguments.GrpcMaxMessageLength,
-                    MaxSendMessageSize = arguments.GrpcMaxMessageLength,
-                    Credentials = ChannelCredentials.Insecure
-                });
-
-                return new FunctionRpcClient(grpcChannel);
+                    GrpcChannel grpcChannel = GrpcChannel.ForAddress(grpcUri, new GrpcChannelOptions()
+                    {
+                        MaxReceiveMessageSize = arguments.GrpcMaxMessageLength,
+                        MaxSendMessageSize = arguments.GrpcMaxMessageLength,
+                        Credentials = ChannelCredentials.Insecure
+                    });
+                    return new FunctionRpcClient(grpcChannel);
+                };
             });
+            services.AddSingleton<IWorker, GrpcWorker>();
 
             services.AddOptions<GrpcWorkerStartupOptions>()
                 .Configure<IConfiguration>((arguments, config) =>
